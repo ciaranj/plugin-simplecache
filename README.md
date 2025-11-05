@@ -58,3 +58,9 @@ The number of seconds to wait between cache cleanup runs.
 
 This determines if the cache status header `Cache-Status` will be added to the
 response headers. This header can have the value `hit`, `miss` or `error`.
+
+#### Include Query Parameters in Cache Key (`queryInKey`)
+*Default: false*
+
+This determines whether the query parameters on the url form part of the key used for storing cacheable requests.
+
