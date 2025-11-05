@@ -1,6 +1,4 @@
-# github.com/pquerna/cachecontrol v0.0.0-20180517163645-1555304b9b35
-## explicit
+# github.com/pquerna/cachecontrol v0.2.0
+## explicit; go 1.16
 github.com/pquerna/cachecontrol
 github.com/pquerna/cachecontrol/cacheobject
-# github.com/stretchr/testify v1.6.1
-## explicit
