@@ -1,4 +1,4 @@
-module github.com/traefik/plugin-simplecache
+module github.com/ciaranj/cacheify
 
 go 1.24
 

@@ -1,4 +1,4 @@
-package plugin_simplecache
+package cacheify
 
 import (
 	"bytes"

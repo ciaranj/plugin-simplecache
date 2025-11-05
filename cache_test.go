@@ -1,4 +1,4 @@
-package plugin_simplecache
+package cacheify
 
 import (
 	"context"
@@ -39,7 +39,7 @@ func TestNew(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := New(context.Background(), nil, test.cfg, "simplecache")
+			_, err := New(context.Background(), nil, test.cfg, "cacheify")
 
 			if test.wantErr && err == nil {
 				t.Fatal("expected error on bad regexp format")
@@ -58,7 +58,7 @@ func TestCache_ServeHTTP(t *testing.T) {
 
 	cfg := &Config{Path: dir, MaxExpiry: 10, Cleanup: 20, AddStatusHeader: true}
 
-	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "simplecache")
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
 	if err != nil {
 		t.Fatal(err)
 	}

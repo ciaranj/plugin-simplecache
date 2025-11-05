@@ -1,5 +1,5 @@
-// Package plugin_simplecache is a plugin to cache responses to disk.
-package plugin_simplecache
+// Package cacheify is a plugin to cache responses to disk.
+package cacheify
 
 import (
 	"encoding/binary"

@@ -1,7 +1,7 @@
-displayName: Simple Cache
-summary: Simple cache plugin middleware caches responses on disk.
+displayName: Cacheify
+summary: Cacheify your traefik routes
 type: middleware
-import: github.com/traefik/plugin-simplecache
-compatibility: TODO
+import: github.com/ciaranj/cacheify
+iconPath: icon.png
 testData:
   path: /tmp
