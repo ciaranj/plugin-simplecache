@@ -56,7 +56,7 @@ func TestCache_ServeHTTP(t *testing.T) {
 		rw.WriteHeader(http.StatusOK)
 	}
 
-	cfg := &Config{Path: dir, MaxExpiry: 10, Cleanup: 20, AddStatusHeader: true}
+	cfg := &Config{Path: dir, MaxExpiry: 10, Cleanup: 20, AddStatusHeader: true, MaxHeaderPairs: 1, MaxHeaderKeyLen: 30, MaxHeaderValueLen: 100}
 
 	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
 	if err != nil {
@@ -69,7 +69,7 @@ func TestCache_ServeHTTP(t *testing.T) {
 	c.ServeHTTP(rw, req)
 
 	if state := rw.Header().Get("Cache-Status"); state != "miss" {
-		t.Errorf("unexprect cache state: want \"miss\", got: %q", state)
+		t.Errorf("unexpected cache state: want \"miss\", got: %q", state)
 	}
 
 	rw = httptest.NewRecorder()
@@ -77,7 +77,7 @@ func TestCache_ServeHTTP(t *testing.T) {
 	c.ServeHTTP(rw, req)
 
 	if state := rw.Header().Get("Cache-Status"); state != "hit" {
-		t.Errorf("unexprect cache state: want \"hit\", got: %q", state)
+		t.Errorf("unexpected cache state: want \"hit\", got: %q", state)
 	}
 }
 

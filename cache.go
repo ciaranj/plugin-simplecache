@@ -3,8 +3,8 @@ package cacheify
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -17,20 +17,26 @@ import (
 
 // Config configures the middleware.
 type Config struct {
-	Path            string `json:"path" yaml:"path" toml:"path"`
-	MaxExpiry       int    `json:"maxExpiry" yaml:"maxExpiry" toml:"maxExpiry"`
-	Cleanup         int    `json:"cleanup" yaml:"cleanup" toml:"cleanup"`
-	AddStatusHeader bool   `json:"addStatusHeader" yaml:"addStatusHeader" toml:"addStatusHeader"`
-	QueryInKey      bool   `json:"queryInKey" yaml:"queryInKey" toml:"queryInKey"`
+	Path              string `json:"path" yaml:"path" toml:"path"`
+	MaxExpiry         int    `json:"maxExpiry" yaml:"maxExpiry" toml:"maxExpiry"`
+	Cleanup           int    `json:"cleanup" yaml:"cleanup" toml:"cleanup"`
+	AddStatusHeader   bool   `json:"addStatusHeader" yaml:"addStatusHeader" toml:"addStatusHeader"`
+	QueryInKey        bool   `json:"queryInKey" yaml:"queryInKey" toml:"queryInKey"`
+	MaxHeaderPairs    int    `json:"maxHeaderPairs" yaml:"maxHeaderPairs" toml:"maxHeaderPairs"`
+	MaxHeaderKeyLen   int    `json:"maxHeaderKeyLen" yaml:"maxHeaderKeyLen" toml:"maxHeaderKeyLen"`
+	MaxHeaderValueLen int    `json:"maxHeaderValueLen" yaml:"maxHeaderValueLen" toml:"maxHeaderValueLen"`
 }
 
 // CreateConfig returns a config instance.
 func CreateConfig() *Config {
 	return &Config{
-		MaxExpiry:       int((5 * time.Minute).Seconds()),
-		Cleanup:         int((5 * time.Minute).Seconds()),
-		AddStatusHeader: true,
-		QueryInKey:      false,
+		MaxExpiry:         int((5 * time.Minute).Seconds()),
+		Cleanup:           int((5 * time.Minute).Seconds()),
+		AddStatusHeader:   true,
+		QueryInKey:        false,
+		MaxHeaderPairs:    255,
+		MaxHeaderKeyLen:   100,
+		MaxHeaderValueLen: 8192,
 	}
 }
 
@@ -58,7 +64,13 @@ func New(_ context.Context, next http.Handler, cfg *Config, name string) (http.H
 		return nil, errors.New("cleanup must be greater or equal to 1")
 	}
 
-	fc, err := newFileCache(cfg.Path, time.Duration(cfg.Cleanup)*time.Second)
+	fc, err := newFileCache(
+		cfg.Path,
+		time.Duration(cfg.Cleanup)*time.Second,
+		cfg.MaxHeaderPairs,
+		cfg.MaxHeaderKeyLen,
+		cfg.MaxHeaderValueLen,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -85,53 +97,54 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	key := cacheKey(r, m.cfg.QueryInKey)
 
-	b, err := m.cache.Get(key)
+	// Try to serve from cache
+	cached, err := m.cache.GetStream(key)
 	if err == nil {
-		var data cacheData
+		defer cached.Body.Close()
 
-		err := json.Unmarshal(b, &data)
-		if err != nil {
-			cs = cacheErrorStatus
-		} else {
-			for key, vals := range data.Headers {
-				for _, val := range vals {
-					w.Header().Add(key, val)
-				}
+		// Write headers
+		for key, vals := range cached.Metadata.Headers {
+			for _, val := range vals {
+				w.Header().Add(key, val)
 			}
-			if m.cfg.AddStatusHeader {
-				w.Header().Set(cacheHeader, cacheHitStatus)
-			}
-			w.WriteHeader(data.Status)
-			_, _ = w.Write(data.Body)
-			return
 		}
-	}
+		if m.cfg.AddStatusHeader {
+			w.Header().Set(cacheHeader, cacheHitStatus)
+		}
 
-	if m.cfg.AddStatusHeader {
-		w.Header().Set(cacheHeader, cs)
-	}
+		// Write status
+		w.WriteHeader(cached.Metadata.Status)
 
-	rw := &responseWriter{ResponseWriter: w}
-	m.next.ServeHTTP(rw, r)
-
-	expiry, ok := m.cacheable(r, w, rw.status)
-	if !ok {
+		// Stream body using pooled buffer to reduce allocations
+		buf := copyBufferPool.Get().(*[]byte)
+		_, _ = io.CopyBuffer(w, cached.Body, *buf)
+		copyBufferPool.Put(buf)
 		return
 	}
 
-	data := cacheData{
-		Status:  rw.status,
-		Headers: w.Header(),
-		Body:    rw.body,
+	// Cache miss - proceed with backend request
+	rw := &responseWriter{
+		ResponseWriter: w,
+		cache:          m.cache,
+		cacheKey:       key,
+		request:        r,
+		config:         m.cfg,
+		checkCacheable: m.cacheable,
+	}
+	m.next.ServeHTTP(rw, r)
+
+	// Finalize cache write if started
+	if err := rw.finalize(); err != nil {
+		log.Printf("Error finalizing cache: %v", err)
 	}
 
-	b, err = json.Marshal(data)
-	if err != nil {
-		log.Printf("Error serializing cache item: %v", err)
-	}
-
-	if err = m.cache.Set(key, b, expiry); err != nil {
-		log.Printf("Error setting cache item: %v", err)
+	// Add Cache-Status header after response is complete
+	if m.cfg.AddStatusHeader {
+		if rw.wasCached {
+			w.Header().Set(cacheHeader, cacheMissStatus)
+		} else {
+			w.Header().Set(cacheHeader, cs)
+		}
 	}
 }
 
@@ -152,53 +165,123 @@ func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (t
 }
 
 func cacheKey(r *http.Request, includeQuery bool) string {
+	// Use strings.Builder to avoid multiple allocations
+	var b strings.Builder
+
+	// Pre-allocate approximate capacity
+	b.Grow(len(r.Method) + len(r.Host) + len(r.URL.Path) + len(r.URL.RawQuery) + 10)
+
 	// Base key with method, host and path
-	key := r.Method + r.Host + r.URL.Path
+	b.WriteString(r.Method)
+	b.WriteString(r.Host)
+	b.WriteString(r.URL.Path)
 
 	// Handle query parameters in a sorted, consistent way
-	if includeQuery && len(r.URL.Query()) > 0 {
-		// Get all query parameter keys
-		params := make([]string, 0, len(r.URL.Query()))
-		for param := range r.URL.Query() {
-			params = append(params, param)
-		}
+	if includeQuery && r.URL.RawQuery != "" {
+		query := r.URL.Query() // Parse once and cache
 
-		// Sort the parameter keys
-		sort.Strings(params)
+		if len(query) > 0 {
+			// Get all query parameter keys
+			params := make([]string, 0, len(query))
+			for param := range query {
+				params = append(params, param)
+			}
 
-		var queryParts []string
-		for _, param := range params {
-			values := r.URL.Query()[param]
-			sort.Strings(values)
+			// Sort the parameter keys
+			sort.Strings(params)
 
-			for _, value := range values {
-				queryParts = append(queryParts, url.QueryEscape(param)+"="+url.QueryEscape(value))
+			b.WriteByte('?')
+			first := true
+			for _, param := range params {
+				values := query[param]
+				sort.Strings(values)
+
+				for _, value := range values {
+					if !first {
+						b.WriteByte('&')
+					}
+					first = false
+					b.WriteString(url.QueryEscape(param))
+					b.WriteByte('=')
+					b.WriteString(url.QueryEscape(value))
+				}
 			}
 		}
-
-		// Join all parameters with &
-		key += "?" + strings.Join(queryParts, "&")
 	}
 
-	return key
+	return b.String()
 }
 
 type responseWriter struct {
 	http.ResponseWriter
-	status int
-	body   []byte
+	cache          *fileCache
+	cacheKey       string
+	request        *http.Request
+	config         *Config
+	checkCacheable func(*http.Request, http.ResponseWriter, int) (time.Duration, bool)
+
+	status        int
+	headerWritten bool
+	wasCached     bool
+	cacheWriter   *streamingCacheWriter
 }
 
 func (rw *responseWriter) Header() http.Header {
 	return rw.ResponseWriter.Header()
 }
 
+func (rw *responseWriter) WriteHeader(s int) {
+	if rw.headerWritten {
+		return
+	}
+	rw.headerWritten = true
+	rw.status = s
+
+	// Make cache decision now that we have status and headers
+	expiry, cacheable := rw.checkCacheable(rw.request, rw.ResponseWriter, s)
+
+	if cacheable {
+		// Start streaming cache write
+		metadata := cacheMetadata{
+			Status:  s,
+			Headers: rw.ResponseWriter.Header(),
+		}
+
+		var err error
+		rw.cacheWriter, err = rw.cache.SetStream(rw.cacheKey, metadata, expiry)
+		if err != nil {
+			log.Printf("Error starting cache write: %v", err)
+		} else {
+			rw.wasCached = true
+		}
+	}
+
+	rw.ResponseWriter.WriteHeader(s)
+}
+
 func (rw *responseWriter) Write(p []byte) (int, error) {
-	rw.body = append(rw.body, p...)
+	// Ensure WriteHeader was called
+	if !rw.headerWritten {
+		rw.WriteHeader(http.StatusOK)
+	}
+
+	// Write to cache if we're caching
+	if rw.cacheWriter != nil {
+		if _, err := rw.cacheWriter.Write(p); err != nil {
+			log.Printf("Error writing to cache: %v", err)
+			// Don't fail the request, just stop caching
+			_ = rw.cacheWriter.Abort()
+			rw.cacheWriter = nil
+		}
+	}
+
+	// Always write to client
 	return rw.ResponseWriter.Write(p)
 }
 
-func (rw *responseWriter) WriteHeader(s int) {
-	rw.status = s
-	rw.ResponseWriter.WriteHeader(s)
+func (rw *responseWriter) finalize() error {
+	if rw.cacheWriter != nil {
+		return rw.cacheWriter.Commit()
+	}
+	return nil
 }

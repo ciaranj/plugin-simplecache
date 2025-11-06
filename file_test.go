@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,30 +16,52 @@ const testCacheKey = "GETlocalhost:8080/test/path"
 func TestFileCache(t *testing.T) {
 	dir := createTempDir(t)
 
-	fc, err := newFileCache(dir, time.Second)
+	fc, err := newFileCache(dir, time.Second, 255, 100, 8192)
 	if err != nil {
 		t.Errorf("unexpected newFileCache error: %v", err)
 	}
 
-	_, err = fc.Get(testCacheKey)
+	_, err = fc.GetStream(testCacheKey)
 	if err == nil {
 		t.Error("unexpected cache content")
 	}
 
 	cacheContent := []byte("some random cache content that should be exact")
+	metadata := cacheMetadata{
+		Status: 200,
+		Headers: map[string][]string{
+			"Content-Type": {"text/plain"},
+		},
+	}
 
-	err = fc.Set(testCacheKey, cacheContent, time.Second)
+	writer, err := fc.SetStream(testCacheKey, metadata, time.Second)
 	if err != nil {
 		t.Errorf("unexpected cache set error: %v", err)
 	}
+	if _, err := writer.Write(cacheContent); err != nil {
+		t.Errorf("unexpected write error: %v", err)
+	}
+	if err := writer.Commit(); err != nil {
+		t.Errorf("unexpected commit error: %v", err)
+	}
 
-	got, err := fc.Get(testCacheKey)
+	resp, err := fc.GetStream(testCacheKey)
 	if err != nil {
 		t.Errorf("unexpected cache get error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Errorf("unexpected read error: %v", err)
 	}
 
 	if !bytes.Equal(got, cacheContent) {
 		t.Errorf("unexpected cache content: want %s, got %s", cacheContent, got)
+	}
+
+	if resp.Metadata.Status != 200 {
+		t.Errorf("unexpected status: want 200, got %d", resp.Metadata.Status)
 	}
 }
 
@@ -54,12 +77,18 @@ func TestFileCache_ConcurrentAccess(t *testing.T) {
 
 	dir := createTempDir(t)
 
-	fc, err := newFileCache(dir, time.Second)
+	fc, err := newFileCache(dir, time.Second, 255, 100, 8192)
 	if err != nil {
 		t.Errorf("unexpected newFileCache error: %v", err)
 	}
 
 	cacheContent := []byte("some random cache content that should be exact")
+	metadata := cacheMetadata{
+		Status: 200,
+		Headers: map[string][]string{
+			"Content-Type": {"text/plain"},
+		},
+	}
 
 	var wg sync.WaitGroup
 
@@ -69,9 +98,13 @@ func TestFileCache_ConcurrentAccess(t *testing.T) {
 		defer wg.Done()
 
 		for {
-			got, _ := fc.Get(testCacheKey)
-			if got != nil && !bytes.Equal(got, cacheContent) {
-				panic(fmt.Errorf("unexpected cache content: want %s, got %s", cacheContent, got))
+			resp, _ := fc.GetStream(testCacheKey)
+			if resp != nil {
+				got, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if !bytes.Equal(got, cacheContent) {
+					panic(fmt.Errorf("unexpected cache content: want %s, got %s", cacheContent, got))
+				}
 			}
 
 			select {
@@ -86,9 +119,15 @@ func TestFileCache_ConcurrentAccess(t *testing.T) {
 		defer wg.Done()
 
 		for {
-			err = fc.Set(testCacheKey, cacheContent, time.Second)
+			writer, err := fc.SetStream(testCacheKey, metadata, time.Second)
 			if err != nil {
 				panic(fmt.Errorf("unexpected cache set error: %w", err))
+			}
+			if _, err := writer.Write(cacheContent); err != nil {
+				panic(fmt.Errorf("unexpected write error: %w", err))
+			}
+			if err := writer.Commit(); err != nil {
+				panic(fmt.Errorf("unexpected commit error: %w", err))
 			}
 
 			select {
@@ -142,17 +181,30 @@ func TestPathMutex(t *testing.T) {
 func BenchmarkFileCache_Get(b *testing.B) {
 	dir := createTempDir(b)
 
-	fc, err := newFileCache(dir, time.Minute)
+	fc, err := newFileCache(dir, time.Minute, 255, 100, 8192)
 	if err != nil {
 		b.Errorf("unexpected newFileCache error: %v", err)
 	}
 
-	_ = fc.Set(testCacheKey, []byte("some random cache content that should be exact"), time.Minute)
+	metadata := cacheMetadata{
+		Status: 200,
+		Headers: map[string][]string{
+			"Content-Type": {"text/plain"},
+		},
+	}
+	cacheContent := []byte("some random cache content that should be exact")
+	writer, _ := fc.SetStream(testCacheKey, metadata, time.Minute)
+	_, _ = writer.Write(cacheContent)
+	_ = writer.Commit()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_, _ = fc.Get(testCacheKey)
+		resp, _ := fc.GetStream(testCacheKey)
+		if resp != nil {
+			_, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
+		}
 	}
 }

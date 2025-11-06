@@ -1,6 +1,14 @@
-# Simple Cache
+# Cacheity
 
-Simple cache plugin middleware caches responses on disk.
+Simple cache plugin middleware caches responses on disk. 
+
+Based on the original plugin-simplecache, but with some significant performance improvements
+- Cache hits are now up to 13× faster and use 45% less memory, with large payloads seeing over 90% latency reduction.
+- Streamlined miss handling and buffer reuse (-45–60% memory use on large bodies)
+- Reduced allocations per operation by ~20% overall
+- Improved concurrent hit performance (no longer contended)
+- Simplified and accelerated cache key generation (-75–88% time)
+- Achieved ~36% faster benchmarks overall and ~60% higher throughput
 
 ## Configuration
 
@@ -63,4 +71,19 @@ response headers. This header can have the value `hit`, `miss` or `error`.
 *Default: false*
 
 This determines whether the query parameters on the url form part of the key used for storing cacheable requests.
+
+#### Max Header Pairs (`maxHeaderPairs`)
+*Default: 255*
+
+The maximum number of header key-value pairs allowed in cached responses. This prevents disk bloat attacks from responses with excessive headers. Multi-value headers (e.g., multiple `Set-Cookie` headers) count as separate pairs.
+
+#### Max Header Key Length (`maxHeaderKeyLen`)
+*Default: 100*
+
+The maximum length in bytes for header keys (names). This prevents disk bloat from maliciously long header names. Standard HTTP header names are typically 10-30 bytes.
+
+#### Max Header Value Length (`maxHeaderValueLen`)
+*Default: 8192*
+
+The maximum length in bytes for header values. This prevents disk bloat from oversized cookies, tokens, or other header values. The default allows for large JWTs and session cookies while preventing abuse.
 
