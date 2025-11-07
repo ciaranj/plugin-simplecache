@@ -31,7 +31,7 @@ type Config struct {
 func CreateConfig() *Config {
 	return &Config{
 		MaxExpiry:         int((5 * time.Minute).Seconds()),
-		Cleanup:           int((5 * time.Minute).Seconds()),
+		Cleanup:           int((10 * time.Minute).Seconds()),
 		AddStatusHeader:   true,
 		QueryInKey:        false,
 		MaxHeaderPairs:    255,
