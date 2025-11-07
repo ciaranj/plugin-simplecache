@@ -176,6 +176,7 @@ type fileCache struct {
 	maxHeaderPairs    int
 	maxHeaderKeyLen   int
 	maxHeaderValueLen int
+	stopVacuum        chan struct{}
 }
 
 func newFileCache(path string, vacuum time.Duration, maxHeaderPairs, maxHeaderKeyLen, maxHeaderValueLen int) (*fileCache, error) {
@@ -194,6 +195,7 @@ func newFileCache(path string, vacuum time.Duration, maxHeaderPairs, maxHeaderKe
 		maxHeaderPairs:    maxHeaderPairs,
 		maxHeaderKeyLen:   maxHeaderKeyLen,
 		maxHeaderValueLen: maxHeaderValueLen,
+		stopVacuum:        make(chan struct{}),
 	}
 
 	go fc.vacuum(vacuum)
@@ -205,8 +207,12 @@ func (c *fileCache) vacuum(interval time.Duration) {
 	timer := time.NewTicker(interval)
 	defer timer.Stop()
 
-	for range timer.C {
-		_ = filepath.Walk(c.path, func(path string, info os.FileInfo, err error) error {
+	for {
+		select {
+		case <-c.stopVacuum:
+			return
+		case <-timer.C:
+			_ = filepath.Walk(c.path, func(path string, info os.FileInfo, err error) error {
 			switch {
 			case err != nil:
 				return err
@@ -218,31 +224,40 @@ func (c *fileCache) vacuum(interval time.Duration) {
 
 			mu := c.pm.MutexAt(key)
 			mu.Lock()
-			defer mu.Unlock()
 
 			// Get the expiry from cache file
 			var t [8]byte
 			f, err := os.Open(filepath.Clean(path))
 			if err != nil {
+				mu.Unlock()
 				// Just skip the file in this case.
 				return nil // nolint:nilerr // skip
 			}
 			if n, err := f.Read(t[:]); err != nil || n != 8 {
 				_ = f.Close()
+				mu.Unlock()
 				return nil
 			}
 			_ = f.Close()
 
 			expires := time.Unix(int64(binary.LittleEndian.Uint64(t[:])), 0)
 			if !expires.Before(time.Now()) {
+				mu.Unlock()
 				return nil
 			}
 
 			// Delete the cache file
 			_ = os.Remove(path)
+			mu.Unlock()
 			return nil
 		})
+		}
 	}
+}
+
+// Stop gracefully stops the vacuum goroutine
+func (c *fileCache) Stop() {
+	close(c.stopVacuum)
 }
 
 // GetStream returns a cached response with a streamable body
@@ -290,6 +305,15 @@ func (c *fileCache) GetStream(key string) (*cachedResponse, error) {
 		return nil, fmt.Errorf("error reading metadata length: %w", err)
 	}
 	metadataLen := binary.LittleEndian.Uint32(lenBuf[:])
+
+	// Protect against metadata bomb DoS attack
+	const maxMetadataSize = 1 << 20 // 1MB should be more than enough for headers
+	if metadataLen > maxMetadataSize {
+		mu.RUnlock()
+		_ = file.Close()
+		_ = os.Remove(p) // Remove malicious/corrupt file
+		return nil, fmt.Errorf("metadata too large: %d bytes (max: %d)", metadataLen, maxMetadataSize)
+	}
 
 	// Read metadata binary
 	metadataBuf := make([]byte, metadataLen)
@@ -432,6 +456,7 @@ func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Du
 	binary.LittleEndian.PutUint64(expiryBuf[:], timestamp)
 	if _, err = bufWriter.Write(expiryBuf[:]); err != nil {
 		_ = file.Close()
+		_ = os.Remove(p) // Clean up partial file
 		bufWriter.Reset(nil)
 		bufferPool.Put(bufWriter)
 		mu.Unlock()
@@ -443,6 +468,7 @@ func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Du
 	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(metadataBinary)))
 	if _, err = bufWriter.Write(lenBuf[:]); err != nil {
 		_ = file.Close()
+		_ = os.Remove(p) // Clean up partial file
 		bufWriter.Reset(nil)
 		bufferPool.Put(bufWriter)
 		mu.Unlock()
@@ -452,6 +478,7 @@ func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Du
 	// Write metadata binary
 	if _, err = bufWriter.Write(metadataBinary); err != nil {
 		_ = file.Close()
+		_ = os.Remove(p) // Clean up partial file
 		bufWriter.Reset(nil)
 		bufferPool.Put(bufWriter)
 		mu.Unlock()
