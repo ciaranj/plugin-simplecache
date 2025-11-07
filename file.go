@@ -177,6 +177,7 @@ type fileCache struct {
 	maxHeaderKeyLen   int
 	maxHeaderValueLen int
 	stopVacuum        chan struct{}
+	stopOnce          sync.Once
 }
 
 func newFileCache(path string, vacuum time.Duration, maxHeaderPairs, maxHeaderKeyLen, maxHeaderValueLen int) (*fileCache, error) {
@@ -256,8 +257,11 @@ func (c *fileCache) vacuum(interval time.Duration) {
 }
 
 // Stop gracefully stops the vacuum goroutine
+// Safe to call multiple times
 func (c *fileCache) Stop() {
-	close(c.stopVacuum)
+	c.stopOnce.Do(func() {
+		close(c.stopVacuum)
+	})
 }
 
 // GetStream returns a cached response with a streamable body
@@ -366,10 +370,13 @@ func (br *bodyReader) Close() error {
 
 // streamingCacheWriter handles streaming writes to a cache file
 type streamingCacheWriter struct {
-	file    *bufio.Writer
-	rawFile *os.File
-	pm      *pathMutex
-	key     string
+	file     *bufio.Writer
+	rawFile  *os.File
+	pm       *pathMutex
+	key      string
+	filepath string
+	done     bool // Prevents double Commit/Abort
+	mu       sync.Mutex
 }
 
 func (scw *streamingCacheWriter) Write(p []byte) (int, error) {
@@ -377,8 +384,17 @@ func (scw *streamingCacheWriter) Write(p []byte) (int, error) {
 }
 
 func (scw *streamingCacheWriter) Abort() error {
+	scw.mu.Lock()
+	defer scw.mu.Unlock()
+
+	if scw.done {
+		return nil // Already committed or aborted
+	}
+	scw.done = true
+
 	_ = scw.file.Flush()
 	_ = scw.rawFile.Close()
+	_ = os.Remove(scw.filepath) // Clean up partial file
 
 	// Return buffer to pool
 	scw.file.Reset(nil)
@@ -390,9 +406,18 @@ func (scw *streamingCacheWriter) Abort() error {
 }
 
 func (scw *streamingCacheWriter) Commit() error {
+	scw.mu.Lock()
+	defer scw.mu.Unlock()
+
+	if scw.done {
+		return nil // Already committed or aborted
+	}
+	scw.done = true
+
 	// Flush buffered writes
 	if err := scw.file.Flush(); err != nil {
 		_ = scw.rawFile.Close()
+		_ = os.Remove(scw.filepath) // Clean up partial file on error
 		scw.file.Reset(nil)
 		bufferPool.Put(scw.file)
 		mu := scw.pm.MutexAt(scw.key)
@@ -401,6 +426,7 @@ func (scw *streamingCacheWriter) Commit() error {
 	}
 
 	if err := scw.rawFile.Close(); err != nil {
+		_ = os.Remove(scw.filepath) // Clean up partial file on error
 		scw.file.Reset(nil)
 		bufferPool.Put(scw.file)
 		mu := scw.pm.MutexAt(scw.key)
@@ -487,10 +513,11 @@ func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Du
 
 	// Return streaming writer (body will be written via Write() calls)
 	return &streamingCacheWriter{
-		file:    bufWriter,
-		rawFile: file,
-		pm:      c.pm,
-		key:     key,
+		file:     bufWriter,
+		rawFile:  file,
+		pm:       c.pm,
+		key:      key,
+		filepath: p,
 	}, nil
 }
 
