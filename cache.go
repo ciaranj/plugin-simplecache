@@ -33,7 +33,7 @@ func CreateConfig() *Config {
 		MaxExpiry:         int((5 * time.Minute).Seconds()),
 		Cleanup:           int((10 * time.Minute).Seconds()),
 		AddStatusHeader:   true,
-		QueryInKey:        false,
+		QueryInKey:        true,
 		MaxHeaderPairs:    255,
 		MaxHeaderKeyLen:   100,
 		MaxHeaderValueLen: 8192,
