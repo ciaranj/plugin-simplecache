@@ -125,6 +125,11 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Cache miss - proceed with backend request
+	// Set cache status header before backend call so it's included in response
+	if m.cfg.AddStatusHeader {
+		w.Header().Set(cacheHeader, cs)
+	}
+
 	rw := &responseWriter{
 		ResponseWriter: w,
 		cache:          m.cache,
@@ -138,15 +143,6 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Finalize cache write if started
 	if err := rw.finalize(); err != nil {
 		log.Printf("Error finalizing cache: %v", err)
-	}
-
-	// Add Cache-Status header after response is complete
-	if m.cfg.AddStatusHeader {
-		if rw.wasCached {
-			w.Header().Set(cacheHeader, cacheMissStatus)
-		} else {
-			w.Header().Set(cacheHeader, cs)
-		}
 	}
 }
 

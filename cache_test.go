@@ -56,7 +56,7 @@ func TestCache_ServeHTTP(t *testing.T) {
 		rw.WriteHeader(http.StatusOK)
 	}
 
-	cfg := &Config{Path: dir, MaxExpiry: 10, Cleanup: 20, AddStatusHeader: true, MaxHeaderPairs: 1, MaxHeaderKeyLen: 30, MaxHeaderValueLen: 100}
+	cfg := &Config{Path: dir, MaxExpiry: 10, Cleanup: 20, AddStatusHeader: true, MaxHeaderPairs: 2, MaxHeaderKeyLen: 30, MaxHeaderValueLen: 100}
 
 	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
 	if err != nil {
