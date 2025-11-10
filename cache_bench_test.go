@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -25,6 +26,7 @@ func createTestCache(b *testing.B, path string) http.Handler {
 		MaxHeaderPairs:    3,
 		MaxHeaderKeyLen:   30,
 		MaxHeaderValueLen: 100,
+		UpdateTimeout:     30, // 30 seconds timeout for waiting on concurrent cache updates
 	}
 
 	// Create a simple backend handler
@@ -198,13 +200,13 @@ func BenchmarkConcurrentCacheMiss(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	i := 0
+	var counter int64
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			// Use unique URL for each iteration to ensure cache miss
+			i := atomic.AddInt64(&counter, 1)
 			req := httptest.NewRequest("GET", fmt.Sprintf("http://example.com/test-%d", i), nil)
 			req.Header.Set("X-Bench-Body-Size", "1024")
-			i++
 			w := httptest.NewRecorder()
 			cache.ServeHTTP(w, req)
 		}
