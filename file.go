@@ -181,7 +181,14 @@ type fileCache struct {
 	maxHeaderValueLen int
 	stopVacuum        chan struct{}
 	stopOnce          sync.Once
-	updateIntents     sync.Map // map[string]*sync.Mutex for update intent tracking
+	updateIntents     sync.Map // map[string]*updateIntent for update intent tracking
+}
+
+// updateIntent tracks an in-progress cache update
+type updateIntent struct {
+	mu   *sync.Mutex
+	done chan struct{} // Closed when update completes, shared by all waiters
+	once sync.Once     // Ensures done is only closed once
 }
 
 func newFileCache(path string, vacuum time.Duration, maxHeaderPairs, maxHeaderKeyLen, maxHeaderValueLen int) (*fileCache, error) {
@@ -291,13 +298,28 @@ func (c *fileCache) Stop() {
 // Returns true if we claimed it (we should fetch), false if someone else has it (we should wait)
 func (c *fileCache) claimUpdateIntent(key string) bool {
 	// Use LoadOrStore to atomically claim the intent
-	intentMu := &sync.Mutex{}
-	actual, loaded := c.updateIntents.LoadOrStore(key, intentMu)
+	intent := &updateIntent{
+		mu:   &sync.Mutex{},
+		done: make(chan struct{}),
+	}
+	actual, loaded := c.updateIntents.LoadOrStore(key, intent)
 
 	if !loaded {
 		// We stored it - we claimed the intent
-		actualMu := actual.(*sync.Mutex)
-		actualMu.Lock() // Lock it so others know we're working
+		actualIntent := actual.(*updateIntent)
+		actualIntent.mu.Lock() // Lock it so others know we're working
+
+		// Spawn a single goroutine to signal completion
+		// This goroutine will unblock when we release the lock
+		go func() {
+			actualIntent.mu.Lock()
+			actualIntent.mu.Unlock()
+			// Update complete - signal all waiters
+			actualIntent.once.Do(func() {
+				close(actualIntent.done)
+			})
+		}()
+
 		return true
 	}
 
@@ -308,19 +330,33 @@ func (c *fileCache) claimUpdateIntent(key string) bool {
 // releaseUpdateIntent releases our claim on updating this cache key
 func (c *fileCache) releaseUpdateIntent(key string) {
 	if val, ok := c.updateIntents.Load(key); ok {
-		mu := val.(*sync.Mutex)
-		mu.Unlock()
+		intent := val.(*updateIntent)
+		intent.mu.Unlock()
 		c.updateIntents.Delete(key)
 	}
 }
 
 // waitForUpdateIntent waits for someone else's update to complete
-func (c *fileCache) waitForUpdateIntent(key string) {
-	if val, ok := c.updateIntents.Load(key); ok {
-		mu := val.(*sync.Mutex)
-		// Wait for the lock (blocks until updater is done)
-		mu.Lock()
-		mu.Unlock()
+// Returns true if wait completed, false if timed out
+// All waiters share the same done channel to prevent goroutine leaks
+func (c *fileCache) waitForUpdateIntent(key string, timeout time.Duration) bool {
+	val, ok := c.updateIntents.Load(key)
+	if !ok {
+		// No intent found - return immediately
+		return true
+	}
+
+	intent := val.(*updateIntent)
+
+	// All waiters select on the same done channel (no goroutine per waiter)
+	// The done channel is closed by the single goroutine spawned in claimUpdateIntent
+	select {
+	case <-intent.done:
+		return true // Wait completed successfully
+	case <-time.After(timeout):
+		// Timeout - clean up the stuck intent to prevent permanent blocking
+		c.updateIntents.Delete(key)
+		return false // Timed out
 	}
 }
 

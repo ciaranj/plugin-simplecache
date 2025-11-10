@@ -87,7 +87,12 @@ The maximum length in bytes for header keys (names). This prevents disk bloat fr
 
 The maximum length in bytes for header values. This prevents disk bloat from oversized cookies, tokens, or other header values. The default allows for large JWTs and session cookies while preventing abuse.
 
-#### Max Header Value Length (`stripResponseCookies`)
+#### Strip Response Cookies (`stripResponseCookies`)
 *Default: true*
 
 If true (the default) cacheify will remove any 'Set-Cookie' headers from any cacheable responses (including the original request.)
+
+#### Update Timeout (`updateTimeout`)
+*Default: 30*
+
+The number of seconds to wait for another request to complete a cache update before timing out and fetching from upstream independently. This prevents requests from waiting indefinitely if an upstream server hangs during a cache miss. When multiple requests arrive for the same uncached resource, the first request fetches from upstream while subsequent requests wait for completion. If the timeout is exceeded, waiting requests will proceed to fetch from upstream themselves rather than block indefinitely.

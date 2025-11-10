@@ -323,6 +323,7 @@ func TestCache_DoubleCheckedLocking(t *testing.T) {
 		MaxHeaderPairs:    2,
 		MaxHeaderKeyLen:   30,
 		MaxHeaderValueLen: 100,
+		UpdateTimeout:     30, // 30 second timeout for waiting
 	}
 
 	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
@@ -376,6 +377,82 @@ func TestCache_DoubleCheckedLocking(t *testing.T) {
 	// We should have at least some cache hits
 	if hits == 0 {
 		t.Error("Expected at least some cache hits from double-checked locking")
+	}
+}
+
+func TestCache_UpdateTimeout(t *testing.T) {
+	dir := createTempDir(t)
+
+	// Track upstream requests
+	var upstreamCalls int32
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		atomic.AddInt32(&upstreamCalls, 1)
+		// Simulate VERY slow upstream (hangs for 60 seconds)
+		time.Sleep(60 * time.Second)
+		rw.Header().Set("Cache-Control", "max-age=20")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("response data"))
+	}
+
+	cfg := &Config{
+		Path:              dir,
+		MaxExpiry:         10,
+		Cleanup:           20,
+		AddStatusHeader:   true,
+		MaxHeaderPairs:    2,
+		MaxHeaderKeyLen:   30,
+		MaxHeaderValueLen: 100,
+		UpdateTimeout:     1, // 1 second timeout - should fire
+	}
+
+	c, err := New(context.Background(), http.HandlerFunc(next), cfg, "cacheify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Launch 2 requests concurrently
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "http://localhost/slow", nil)
+			rw := httptest.NewRecorder()
+			c.ServeHTTP(rw, req)
+		}()
+	}
+
+	// Wait with overall timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		elapsed := time.Since(start)
+		upstreamCount := atomic.LoadInt32(&upstreamCalls)
+
+		t.Logf("Both requests completed in %v", elapsed)
+		t.Logf("Upstream called %d times", upstreamCount)
+
+		// Should have 2 upstream calls (timeout causes second request to fetch too)
+		if upstreamCount != 2 {
+			t.Errorf("Expected 2 upstream calls due to timeout, got %d", upstreamCount)
+		}
+
+		// Should complete in ~60s (both running in parallel after timeout)
+		// not 120s (sequential)
+		if elapsed > 70*time.Second {
+			t.Errorf("Took too long: %v (timeout not working?)", elapsed)
+		}
+
+	case <-time.After(75 * time.Second):
+		t.Fatal("Test timed out - requests hung")
 	}
 }
 

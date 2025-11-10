@@ -22,7 +22,7 @@ func createTestCache(b *testing.B, path string) http.Handler {
 		Cleanup:           300,
 		AddStatusHeader:   true,
 		QueryInKey:        false,
-		MaxHeaderPairs:    2,
+		MaxHeaderPairs:    3,
 		MaxHeaderKeyLen:   30,
 		MaxHeaderValueLen: 100,
 	}

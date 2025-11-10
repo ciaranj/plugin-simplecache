@@ -26,6 +26,7 @@ type Config struct {
 	MaxHeaderPairs       int    `json:"maxHeaderPairs" yaml:"maxHeaderPairs" toml:"maxHeaderPairs"`
 	MaxHeaderKeyLen      int    `json:"maxHeaderKeyLen" yaml:"maxHeaderKeyLen" toml:"maxHeaderKeyLen"`
 	MaxHeaderValueLen    int    `json:"maxHeaderValueLen" yaml:"maxHeaderValueLen" toml:"maxHeaderValueLen"`
+	UpdateTimeout        int    `json:"updateTimeout" yaml:"updateTimeout" toml:"updateTimeout"` // Seconds to wait for another request to complete cache update
 }
 
 // CreateConfig returns a config instance.
@@ -39,6 +40,7 @@ func CreateConfig() *Config {
 		MaxHeaderPairs:       255,
 		MaxHeaderKeyLen:      100,
 		MaxHeaderValueLen:    8192,
+		UpdateTimeout:        30, // 30 seconds default timeout waiting for cache updates
 	}
 }
 
@@ -127,34 +129,41 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Cache miss - use double-checked locking via update intent
 	// Try to claim responsibility for fetching this resource
 	if !m.cache.claimUpdateIntent(key) {
-		// Someone else claimed it - wait for them to finish
-		m.cache.waitForUpdateIntent(key)
+		// Someone else claimed it - wait for them to finish (with timeout)
+		timeout := time.Duration(m.cfg.UpdateTimeout) * time.Second
+		completed := m.cache.waitForUpdateIntent(key, timeout)
 
-		// Second check: try cache again now that they're done
-		cached, err := m.cache.GetStream(key)
-		if err == nil {
-			defer cached.Body.Close()
+		if completed {
+			// Wait completed successfully - try cache again now that they're done
+			cached, err := m.cache.GetStream(key)
+			if err == nil {
+				defer cached.Body.Close()
 
-			// Write headers
-			for key, vals := range cached.Metadata.Headers {
-				for _, val := range vals {
-					w.Header().Add(key, val)
+				// Write headers
+				for key, vals := range cached.Metadata.Headers {
+					for _, val := range vals {
+						w.Header().Add(key, val)
+					}
 				}
-			}
-			if m.cfg.AddStatusHeader {
-				w.Header().Set(cacheHeader, cacheHitStatus)
-			}
+				if m.cfg.AddStatusHeader {
+					w.Header().Set(cacheHeader, cacheHitStatus)
+				}
 
-			// Write status
-			w.WriteHeader(cached.Metadata.Status)
+				// Write status
+				w.WriteHeader(cached.Metadata.Status)
 
-			// Stream body using pooled buffer to reduce allocations
-			buf := copyBufferPool.Get().(*[]byte)
-			_, _ = io.CopyBuffer(w, cached.Body, *buf)
-			copyBufferPool.Put(buf)
-			return
+				// Stream body using pooled buffer to reduce allocations
+				buf := copyBufferPool.Get().(*[]byte)
+				_, _ = io.CopyBuffer(w, cached.Body, *buf)
+				copyBufferPool.Put(buf)
+				return
+			}
+		} else {
+			// Timeout waiting - other request may be hung/slow
+			// Fall through to fetch ourselves rather than wait forever
+			log.Printf("Timeout waiting for cache update, proceeding with upstream fetch")
 		}
-		// If still a miss, fall through to fetch ourselves
+		// If timeout or still a miss, fall through to fetch ourselves
 	}
 
 	// We claimed the update intent - we're responsible for fetching
