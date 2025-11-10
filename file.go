@@ -3,6 +3,7 @@ package cacheify
 
 import (
 	"bufio"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -11,11 +12,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
 
 var errCacheMiss = errors.New("cache miss")
+var errCacheWriteInProgress = errors.New("cache write in progress")
 
 // bufferPool pools 4KB bufio.Writer buffers to reduce allocations
 var bufferPool = sync.Pool{
@@ -178,6 +181,7 @@ type fileCache struct {
 	maxHeaderValueLen int
 	stopVacuum        chan struct{}
 	stopOnce          sync.Once
+	updateIntents     sync.Map // map[string]*sync.Mutex for update intent tracking
 }
 
 func newFileCache(path string, vacuum time.Duration, maxHeaderPairs, maxHeaderKeyLen, maxHeaderValueLen int) (*fileCache, error) {
@@ -199,6 +203,10 @@ func newFileCache(path string, vacuum time.Duration, maxHeaderPairs, maxHeaderKe
 		stopVacuum:        make(chan struct{}),
 	}
 
+	// Clean up any orphaned temp files from previous crashes/restarts
+	// This runs synchronously on startup to ensure clean state
+	fc.cleanupTempFiles()
+
 	go fc.vacuum(vacuum)
 
 	return fc, nil
@@ -213,47 +221,62 @@ func (c *fileCache) vacuum(interval time.Duration) {
 		case <-c.stopVacuum:
 			return
 		case <-timer.C:
-			_ = filepath.Walk(c.path, func(path string, info os.FileInfo, err error) error {
-			switch {
-			case err != nil:
-				return err
-			case info.IsDir():
-				return nil
-			}
-
-			key := filepath.Base(path)
-
-			mu := c.pm.MutexAt(key)
-			mu.Lock()
-
-			// Get the expiry from cache file
-			var t [8]byte
-			f, err := os.Open(filepath.Clean(path))
-			if err != nil {
-				mu.Unlock()
-				// Just skip the file in this case.
-				return nil // nolint:nilerr // skip
-			}
-			if n, err := f.Read(t[:]); err != nil || n != 8 {
-				_ = f.Close()
-				mu.Unlock()
-				return nil
-			}
-			_ = f.Close()
-
-			expires := time.Unix(int64(binary.LittleEndian.Uint64(t[:])), 0)
-			if !expires.Before(time.Now()) {
-				mu.Unlock()
-				return nil
-			}
-
-			// Delete the cache file
-			_ = os.Remove(path)
-			mu.Unlock()
-			return nil
-		})
+			c.cleanupExpiredFiles()
 		}
 	}
+}
+
+// cleanupExpiredFiles removes expired cache files and aged temp files
+func (c *fileCache) cleanupExpiredFiles() {
+	_ = filepath.Walk(c.path, func(path string, info os.FileInfo, err error) error {
+		switch {
+		case err != nil:
+			return err
+		case info.IsDir():
+			return nil
+		}
+
+		filename := filepath.Base(path)
+
+		// Clean up temp files that are older than 1 hour
+		// These are orphaned from crashes or failed writes
+		if isTempFile(filename) {
+			if time.Since(info.ModTime()) > time.Hour {
+				_ = os.Remove(path)
+			}
+			return nil
+		}
+
+		key := filename
+		mu := c.pm.MutexAt(key)
+		mu.Lock()
+
+		// Get the expiry from cache file
+		var t [8]byte
+		f, err := os.Open(filepath.Clean(path))
+		if err != nil {
+			mu.Unlock()
+			// Just skip the file in this case.
+			return nil // nolint:nilerr // skip
+		}
+		if n, err := f.Read(t[:]); err != nil || n != 8 {
+			_ = f.Close()
+			mu.Unlock()
+			return nil
+		}
+		_ = f.Close()
+
+		expires := time.Unix(int64(binary.LittleEndian.Uint64(t[:])), 0)
+		if !expires.Before(time.Now()) {
+			mu.Unlock()
+			return nil
+		}
+
+		// Delete the expired cache file
+		_ = os.Remove(path)
+		mu.Unlock()
+		return nil
+	})
 }
 
 // Stop gracefully stops the vacuum goroutine
@@ -262,6 +285,43 @@ func (c *fileCache) Stop() {
 	c.stopOnce.Do(func() {
 		close(c.stopVacuum)
 	})
+}
+
+// claimUpdateIntent attempts to claim responsibility for updating this cache key
+// Returns true if we claimed it (we should fetch), false if someone else has it (we should wait)
+func (c *fileCache) claimUpdateIntent(key string) bool {
+	// Use LoadOrStore to atomically claim the intent
+	intentMu := &sync.Mutex{}
+	actual, loaded := c.updateIntents.LoadOrStore(key, intentMu)
+
+	if !loaded {
+		// We stored it - we claimed the intent
+		actualMu := actual.(*sync.Mutex)
+		actualMu.Lock() // Lock it so others know we're working
+		return true
+	}
+
+	// Someone else claimed it already
+	return false
+}
+
+// releaseUpdateIntent releases our claim on updating this cache key
+func (c *fileCache) releaseUpdateIntent(key string) {
+	if val, ok := c.updateIntents.Load(key); ok {
+		mu := val.(*sync.Mutex)
+		mu.Unlock()
+		c.updateIntents.Delete(key)
+	}
+}
+
+// waitForUpdateIntent waits for someone else's update to complete
+func (c *fileCache) waitForUpdateIntent(key string) {
+	if val, ok := c.updateIntents.Load(key); ok {
+		mu := val.(*sync.Mutex)
+		// Wait for the lock (blocks until updater is done)
+		mu.Lock()
+		mu.Unlock()
+	}
 }
 
 // GetStream returns a cached response with a streamable body
@@ -370,13 +430,14 @@ func (br *bodyReader) Close() error {
 
 // streamingCacheWriter handles streaming writes to a cache file
 type streamingCacheWriter struct {
-	file     *bufio.Writer
-	rawFile  *os.File
-	pm       *pathMutex
-	key      string
-	filepath string
-	done     bool // Prevents double Commit/Abort
-	mu       sync.Mutex
+	file         *bufio.Writer
+	rawFile      *os.File
+	pm           *pathMutex
+	key          string
+	filepath     string // Final destination path
+	tempFilepath string // Temporary write path
+	done         bool   // Prevents double Commit/Abort
+	mu           sync.Mutex
 }
 
 func (scw *streamingCacheWriter) Write(p []byte) (int, error) {
@@ -394,7 +455,12 @@ func (scw *streamingCacheWriter) Abort() error {
 
 	_ = scw.file.Flush()
 	_ = scw.rawFile.Close()
-	_ = os.Remove(scw.filepath) // Clean up partial file
+
+	// Clean up temporary file (not the final filepath, which shouldn't exist yet)
+	if err := os.Remove(scw.tempFilepath); err != nil {
+		// Log but don't fail - cleanup is best effort
+		// The vacuum process will eventually remove expired temp files
+	}
 
 	// Return buffer to pool
 	scw.file.Reset(nil)
@@ -417,7 +483,7 @@ func (scw *streamingCacheWriter) Commit() error {
 	// Flush buffered writes
 	if err := scw.file.Flush(); err != nil {
 		_ = scw.rawFile.Close()
-		_ = os.Remove(scw.filepath) // Clean up partial file on error
+		_ = os.Remove(scw.tempFilepath) // Clean up temp file on error
 		scw.file.Reset(nil)
 		bufferPool.Put(scw.file)
 		mu := scw.pm.MutexAt(scw.key)
@@ -425,8 +491,9 @@ func (scw *streamingCacheWriter) Commit() error {
 		return fmt.Errorf("error flushing cache file: %w", err)
 	}
 
+	// Close the file BEFORE rename (required on Windows)
 	if err := scw.rawFile.Close(); err != nil {
-		_ = os.Remove(scw.filepath) // Clean up partial file on error
+		_ = os.Remove(scw.tempFilepath) // Clean up temp file on error
 		scw.file.Reset(nil)
 		bufferPool.Put(scw.file)
 		mu := scw.pm.MutexAt(scw.key)
@@ -438,17 +505,31 @@ func (scw *streamingCacheWriter) Commit() error {
 	scw.file.Reset(nil)
 	bufferPool.Put(scw.file)
 
+	// Atomically move temp file to final destination
+	// This ensures partial writes are never visible as valid cache entries
+	if err := atomicRename(scw.tempFilepath, scw.filepath); err != nil {
+		_ = os.Remove(scw.tempFilepath) // Clean up on failure
+		mu := scw.pm.MutexAt(scw.key)
+		mu.Unlock()
+		return fmt.Errorf("error committing cache file: %w", err)
+	}
+
 	mu := scw.pm.MutexAt(scw.key)
 	mu.Unlock()
 
 	return nil
 }
 
-// SetStream starts a streaming cache write
+// SetStream starts a streaming cache write (non-blocking)
+// Returns errCacheWriteInProgress if another writer currently holds the lock
 // Caller holds exclusive write lock until Commit() or Abort()
 func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Duration) (*streamingCacheWriter, error) {
 	mu := c.pm.MutexAt(key)
-	mu.Lock()
+
+	// Non-blocking lock acquisition for double-checked locking
+	if !mu.TryLock() {
+		return nil, errCacheWriteInProgress
+	}
 
 	p := keyPath(c.path, key)
 
@@ -465,11 +546,14 @@ func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Du
 		return nil, fmt.Errorf("error marshaling metadata: %w", err)
 	}
 
-	// Write directly to destination file (we hold exclusive lock)
-	file, err := os.OpenFile(filepath.Clean(p), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	// Write to a temporary file first, then atomically rename on commit
+	// This prevents partial writes from ever being visible as valid cache entries
+	// Format: {final-path}.tmp.{random}
+	tempPath := p + ".tmp." + randomSuffix()
+	file, err := os.OpenFile(filepath.Clean(tempPath), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		mu.Unlock()
-		return nil, fmt.Errorf("error creating cache file: %w", err)
+		return nil, fmt.Errorf("error creating temp cache file: %w", err)
 	}
 
 	// Get pooled 4KB buffer and attach to file
@@ -482,7 +566,7 @@ func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Du
 	binary.LittleEndian.PutUint64(expiryBuf[:], timestamp)
 	if _, err = bufWriter.Write(expiryBuf[:]); err != nil {
 		_ = file.Close()
-		_ = os.Remove(p) // Clean up partial file
+		_ = os.Remove(tempPath) // Clean up temp file
 		bufWriter.Reset(nil)
 		bufferPool.Put(bufWriter)
 		mu.Unlock()
@@ -494,7 +578,7 @@ func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Du
 	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(metadataBinary)))
 	if _, err = bufWriter.Write(lenBuf[:]); err != nil {
 		_ = file.Close()
-		_ = os.Remove(p) // Clean up partial file
+		_ = os.Remove(tempPath) // Clean up temp file
 		bufWriter.Reset(nil)
 		bufferPool.Put(bufWriter)
 		mu.Unlock()
@@ -504,7 +588,7 @@ func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Du
 	// Write metadata binary
 	if _, err = bufWriter.Write(metadataBinary); err != nil {
 		_ = file.Close()
-		_ = os.Remove(p) // Clean up partial file
+		_ = os.Remove(tempPath) // Clean up temp file
 		bufWriter.Reset(nil)
 		bufferPool.Put(bufWriter)
 		mu.Unlock()
@@ -513,16 +597,46 @@ func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Du
 
 	// Return streaming writer (body will be written via Write() calls)
 	return &streamingCacheWriter{
-		file:     bufWriter,
-		rawFile:  file,
-		pm:       c.pm,
-		key:      key,
-		filepath: p,
+		file:         bufWriter,
+		rawFile:      file,
+		pm:           c.pm,
+		key:          key,
+		filepath:     p,
+		tempFilepath: tempPath,
 	}, nil
 }
 
 func keyHash(key string) [32]byte {
 	return sha256.Sum256([]byte(key))
+}
+
+// randomSuffix generates a random suffix for temporary files
+func randomSuffix() string {
+	var buf [8]byte
+	_, _ = rand.Read(buf[:])
+	return hex.EncodeToString(buf[:])
+}
+
+// isTempFile checks if a filename is a temporary cache file
+// Temp files have the format: {hash}.tmp.{random16chars}
+func isTempFile(filename string) bool {
+	return strings.Contains(filename, ".tmp.")
+}
+
+// cleanupTempFiles removes all temporary files in the cache directory
+// This is called on startup to clean up orphaned temp files from crashes
+func (c *fileCache) cleanupTempFiles() {
+	_ = filepath.Walk(c.path, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+
+		if isTempFile(filepath.Base(path)) {
+			_ = os.Remove(path)
+		}
+
+		return nil
+	})
 }
 
 func keyPath(path, key string) string {
@@ -600,6 +714,10 @@ func (l *fileLock) RUnlock() {
 
 func (l *fileLock) Lock() {
 	l.mu.Lock()
+}
+
+func (l *fileLock) TryLock() bool {
+	return l.mu.TryLock()
 }
 
 func (l *fileLock) Unlock() {

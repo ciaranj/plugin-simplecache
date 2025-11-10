@@ -99,7 +99,7 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	key := cacheKey(r, m.cfg.QueryInKey)
 
-	// Try to serve from cache
+	// First check: Try to serve from cache (non-blocking read)
 	cached, err := m.cache.GetStream(key)
 	if err == nil {
 		defer cached.Body.Close()
@@ -124,6 +124,43 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cache miss - use double-checked locking via update intent
+	// Try to claim responsibility for fetching this resource
+	if !m.cache.claimUpdateIntent(key) {
+		// Someone else claimed it - wait for them to finish
+		m.cache.waitForUpdateIntent(key)
+
+		// Second check: try cache again now that they're done
+		cached, err := m.cache.GetStream(key)
+		if err == nil {
+			defer cached.Body.Close()
+
+			// Write headers
+			for key, vals := range cached.Metadata.Headers {
+				for _, val := range vals {
+					w.Header().Add(key, val)
+				}
+			}
+			if m.cfg.AddStatusHeader {
+				w.Header().Set(cacheHeader, cacheHitStatus)
+			}
+
+			// Write status
+			w.WriteHeader(cached.Metadata.Status)
+
+			// Stream body using pooled buffer to reduce allocations
+			buf := copyBufferPool.Get().(*[]byte)
+			_, _ = io.CopyBuffer(w, cached.Body, *buf)
+			copyBufferPool.Put(buf)
+			return
+		}
+		// If still a miss, fall through to fetch ourselves
+	}
+
+	// We claimed the update intent - we're responsible for fetching
+	// Make sure to release intent when done
+	defer m.cache.releaseUpdateIntent(key)
+
 	// Cache miss - proceed with backend request
 	// Set cache status header before backend call so it's included in response
 	if m.cfg.AddStatusHeader {
@@ -138,12 +175,25 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		config:         m.cfg,
 		checkCacheable: m.cacheable,
 	}
-	m.next.ServeHTTP(rw, r)
 
-	// Finalize cache write if started
-	if err := rw.finalize(); err != nil {
-		log.Printf("Error finalizing cache: %v", err)
-	}
+	// Ensure finalize is called even if ServeHTTP panics
+	// This prevents lock leaks and partial cache files
+	defer func() {
+		if r := recover(); r != nil {
+			// A panic occurred - abort the cache write
+			if err := rw.abort(); err != nil {
+				log.Printf("Error aborting cache: %v", err)
+			}
+			panic(r) // Re-panic after cleanup
+		}
+
+		// Normal completion - finalize (commit or abort based on errors)
+		if err := rw.finalize(); err != nil {
+			log.Printf("Error finalizing cache: %v", err)
+		}
+	}()
+
+	m.next.ServeHTTP(rw, r)
 }
 
 func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (time.Duration, bool) {
@@ -222,6 +272,7 @@ type responseWriter struct {
 	headerWritten bool
 	wasCached     bool
 	cacheWriter   *streamingCacheWriter
+	writeErr      error // Track if any write errors occurred
 }
 
 func (rw *responseWriter) Header() http.Header {
@@ -244,7 +295,7 @@ func (rw *responseWriter) WriteHeader(s int) {
 			rw.ResponseWriter.Header().Del("Set-Cookie")
 		}
 
-		// Start streaming cache write
+		// Try to start streaming cache write (non-blocking for double-checked locking)
 		metadata := cacheMetadata{
 			Status:  s,
 			Headers: rw.ResponseWriter.Header(),
@@ -253,7 +304,11 @@ func (rw *responseWriter) WriteHeader(s int) {
 		var err error
 		rw.cacheWriter, err = rw.cache.SetStream(rw.cacheKey, metadata, expiry)
 		if err != nil {
-			log.Printf("Error starting cache write: %v", err)
+			// errCacheWriteInProgress means another request beat us to it
+			// That's fine - they'll populate the cache, we just stream from upstream
+			if !errors.Is(err, errCacheWriteInProgress) {
+				log.Printf("Error starting cache write: %v", err)
+			}
 		} else {
 			rw.wasCached = true
 		}
@@ -275,16 +330,34 @@ func (rw *responseWriter) Write(p []byte) (int, error) {
 			// Don't fail the request, just stop caching
 			_ = rw.cacheWriter.Abort()
 			rw.cacheWriter = nil
+			rw.writeErr = err
 		}
 	}
 
 	// Always write to client
-	return rw.ResponseWriter.Write(p)
+	n, err := rw.ResponseWriter.Write(p)
+	if err != nil && rw.writeErr == nil {
+		rw.writeErr = err
+	}
+	return n, err
+}
+
+func (rw *responseWriter) abort() error {
+	if rw.cacheWriter != nil {
+		rw.cacheWriter.Abort()
+	}
+	return nil
 }
 
 func (rw *responseWriter) finalize() error {
-	if rw.cacheWriter != nil {
-		return rw.cacheWriter.Commit()
+	if rw.cacheWriter == nil {
+		return nil
 	}
-	return nil
+
+	// If there were any write errors, abort instead of commit
+	if rw.writeErr != nil {
+		return rw.cacheWriter.Abort()
+	}
+
+	return rw.cacheWriter.Commit()
 }

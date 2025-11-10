@@ -3,6 +3,7 @@ package cacheify
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -121,6 +122,16 @@ func TestFileCache_ConcurrentAccess(t *testing.T) {
 		for {
 			writer, err := fc.SetStream(testCacheKey, metadata, time.Second)
 			if err != nil {
+				// Expected: cache write in progress (another writer has the lock)
+				if errors.Is(err, errCacheWriteInProgress) {
+					// Skip this iteration and try again
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						continue
+					}
+				}
 				panic(fmt.Errorf("unexpected cache set error: %w", err))
 			}
 			if _, err := writer.Write(cacheContent); err != nil {
