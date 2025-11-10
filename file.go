@@ -181,14 +181,14 @@ type fileCache struct {
 	maxHeaderValueLen int
 	stopVacuum        chan struct{}
 	stopOnce          sync.Once
-	updateIntents     sync.Map // map[string]*updateIntent for update intent tracking
+	updateIntents     map[string]*updateIntent // Track in-progress cache updates
+	updateIntentsLock sync.RWMutex             // Protects updateIntents map
 }
 
 // updateIntent tracks an in-progress cache update
+// Uses a channel for efficient signaling without goroutines or mutexes
 type updateIntent struct {
-	mu   *sync.Mutex
-	done chan struct{} // Closed when update completes, shared by all waiters
-	once sync.Once     // Ensures done is only closed once
+	done chan struct{} // Closed when update completes, signals all waiters
 }
 
 func newFileCache(path string, vacuum time.Duration, maxHeaderPairs, maxHeaderKeyLen, maxHeaderValueLen int) (*fileCache, error) {
@@ -208,6 +208,7 @@ func newFileCache(path string, vacuum time.Duration, maxHeaderPairs, maxHeaderKe
 		maxHeaderKeyLen:   maxHeaderKeyLen,
 		maxHeaderValueLen: maxHeaderValueLen,
 		stopVacuum:        make(chan struct{}),
+		updateIntents:     make(map[string]*updateIntent),
 	}
 
 	// Clean up any orphaned temp files from previous crashes/restarts
@@ -297,65 +298,58 @@ func (c *fileCache) Stop() {
 // claimUpdateIntent attempts to claim responsibility for updating this cache key
 // Returns true if we claimed it (we should fetch), false if someone else has it (we should wait)
 func (c *fileCache) claimUpdateIntent(key string) bool {
-	// Use LoadOrStore to atomically claim the intent
+	c.updateIntentsLock.Lock()
+	defer c.updateIntentsLock.Unlock()
+
+	// Check if someone else is already updating this key
+	if _, exists := c.updateIntents[key]; exists {
+		// Someone else claimed it already
+		return false
+	}
+
+	// We claim it - create intent with done channel
 	intent := &updateIntent{
-		mu:   &sync.Mutex{},
 		done: make(chan struct{}),
 	}
-	actual, loaded := c.updateIntents.LoadOrStore(key, intent)
+	c.updateIntents[key] = intent
 
-	if !loaded {
-		// We stored it - we claimed the intent
-		actualIntent := actual.(*updateIntent)
-		actualIntent.mu.Lock() // Lock it so others know we're working
-
-		// Spawn a single goroutine to signal completion
-		// This goroutine will unblock when we release the lock
-		go func() {
-			actualIntent.mu.Lock()
-			actualIntent.mu.Unlock()
-			// Update complete - signal all waiters
-			actualIntent.once.Do(func() {
-				close(actualIntent.done)
-			})
-		}()
-
-		return true
-	}
-
-	// Someone else claimed it already
-	return false
+	return true
 }
 
 // releaseUpdateIntent releases our claim on updating this cache key
 func (c *fileCache) releaseUpdateIntent(key string) {
-	if val, ok := c.updateIntents.Load(key); ok {
-		intent := val.(*updateIntent)
-		intent.mu.Unlock()
-		c.updateIntents.Delete(key)
+	c.updateIntentsLock.Lock()
+	defer c.updateIntentsLock.Unlock()
+
+	if intent, ok := c.updateIntents[key]; ok {
+		close(intent.done) // Signal all waiters that update is complete
+		delete(c.updateIntents, key)
 	}
 }
 
 // waitForUpdateIntent waits for someone else's update to complete
 // Returns true if wait completed, false if timed out
-// All waiters share the same done channel to prevent goroutine leaks
+// Uses channel-based signaling for efficient waiting
 func (c *fileCache) waitForUpdateIntent(key string, timeout time.Duration) bool {
-	val, ok := c.updateIntents.Load(key)
-	if !ok {
+	// Get the intent to wait on
+	c.updateIntentsLock.RLock()
+	intent, exists := c.updateIntents[key]
+	c.updateIntentsLock.RUnlock()
+
+	if !exists {
 		// No intent found - return immediately
 		return true
 	}
 
-	intent := val.(*updateIntent)
-
-	// All waiters select on the same done channel (no goroutine per waiter)
-	// The done channel is closed by the single goroutine spawned in claimUpdateIntent
+	// Wait for done channel to be closed or timeout
 	select {
 	case <-intent.done:
 		return true // Wait completed successfully
 	case <-time.After(timeout):
 		// Timeout - clean up the stuck intent to prevent permanent blocking
-		c.updateIntents.Delete(key)
+		c.updateIntentsLock.Lock()
+		delete(c.updateIntents, key)
+		c.updateIntentsLock.Unlock()
 		return false // Timed out
 	}
 }

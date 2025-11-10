@@ -128,7 +128,8 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Cache miss - use double-checked locking via update intent
 	// Try to claim responsibility for fetching this resource
-	if !m.cache.claimUpdateIntent(key) {
+	claimed := m.cache.claimUpdateIntent(key)
+	if !claimed {
 		// Someone else claimed it - wait for them to finish (with timeout)
 		timeout := time.Duration(m.cfg.UpdateTimeout) * time.Second
 		completed := m.cache.waitForUpdateIntent(key, timeout)
@@ -160,15 +161,17 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			// Timeout waiting - other request may be hung/slow
-			// Fall through to fetch ourselves rather than wait forever
+			// Fall through to fetch ourselves, but first try to claim the intent
 			log.Printf("Timeout waiting for cache update, proceeding with upstream fetch")
+			claimed = m.cache.claimUpdateIntent(key)
 		}
 		// If timeout or still a miss, fall through to fetch ourselves
 	}
 
-	// We claimed the update intent - we're responsible for fetching
-	// Make sure to release intent when done
-	defer m.cache.releaseUpdateIntent(key)
+	// Only release the update intent if we actually claimed it
+	if claimed {
+		defer m.cache.releaseUpdateIntent(key)
+	}
 
 	// Cache miss - proceed with backend request
 	// Set cache status header before backend call so it's included in response
