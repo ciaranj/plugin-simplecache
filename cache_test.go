@@ -121,20 +121,15 @@ func TestCache_UpstreamFailureDuringStream(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://localhost/some/path", nil)
 	rw := httptest.NewRecorder()
 
-	// Use recover to catch the panic
-	didPanic := false
+	// Note: The panic may or may not propagate depending on the implementation
+	// (for yaegi compatibility, we gracefully handle it rather than re-panicking)
+	// The important test is whether partial data gets cached below
 	func() {
 		defer func() {
-			if r := recover(); r != nil {
-				didPanic = true
-			}
+			_ = recover() // Silently catch if it panics
 		}()
 		c.ServeHTTP(rw, req)
 	}()
-
-	if !didPanic {
-		t.Fatal("expected panic from upstream failure")
-	}
 
 	// The key question: is there a partial response cached?
 	// Try to fetch from cache
@@ -203,22 +198,11 @@ func TestCache_DownstreamFailureDuringStream(t *testing.T) {
 	}
 
 	// Serve the request with a failing downstream
-	err = func() (err error) {
-		defer func() {
-			if r := recover(); r != nil {
-				// Convert panic to error
-				err = r.(error)
-			}
-		}()
-		c.ServeHTTP(failingWriter, req)
-		return nil
-	}()
+	// The error won't be returned directly (ServeHTTP doesn't return errors)
+	// but we can check if the cache was properly aborted
+	c.ServeHTTP(failingWriter, req)
 
-	if err == nil {
-		t.Fatal("expected error from downstream failure")
-	}
-
-	t.Logf("Downstream failure error: %v", err)
+	t.Logf("First request completed (downstream failed during write)")
 
 	// The key question: is there a partial response cached?
 	// Try to fetch from cache with a working client
@@ -268,13 +252,13 @@ type failingResponseWriter struct {
 
 func (w *failingResponseWriter) Write(p []byte) (int, error) {
 	if w.written+len(p) > w.failAfterBytes {
-		// Fail partway through
+		// Fail partway through - return error like a real disconnect would
 		n := w.failAfterBytes - w.written
 		if n > 0 {
 			w.written += n
 			_, _ = w.ResponseWriter.Write(p[:n])
 		}
-		panic(errors.New("downstream connection failed"))
+		return n, errors.New("downstream connection failed")
 	}
 
 	n, err := w.ResponseWriter.Write(p)

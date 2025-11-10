@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -175,7 +176,7 @@ type cachedResponse struct {
 
 type fileCache struct {
 	path              string
-	pm                *pathMutex
+	lm                *lockManager
 	maxHeaderPairs    int
 	maxHeaderKeyLen   int
 	maxHeaderValueLen int
@@ -203,7 +204,7 @@ func newFileCache(path string, vacuum time.Duration, maxHeaderPairs, maxHeaderKe
 
 	fc := &fileCache{
 		path:              path,
-		pm:                &pathMutex{lock: map[string]*fileLock{}},
+		lm:                newLockManager(),
 		maxHeaderPairs:    maxHeaderPairs,
 		maxHeaderKeyLen:   maxHeaderKeyLen,
 		maxHeaderValueLen: maxHeaderValueLen,
@@ -256,33 +257,33 @@ func (c *fileCache) cleanupExpiredFiles() {
 		}
 
 		key := filename
-		mu := c.pm.MutexAt(key)
-		mu.Lock()
+		mu := c.lm.getLock(key)
+		mu.Lock(c.lm)
 
 		// Get the expiry from cache file
 		var t [8]byte
 		f, err := os.Open(filepath.Clean(path))
 		if err != nil {
-			mu.Unlock()
+			mu.Unlock(c.lm)
 			// Just skip the file in this case.
 			return nil // nolint:nilerr // skip
 		}
 		if n, err := f.Read(t[:]); err != nil || n != 8 {
 			_ = f.Close()
-			mu.Unlock()
+			mu.Unlock(c.lm)
 			return nil
 		}
 		_ = f.Close()
 
 		expires := time.Unix(int64(binary.LittleEndian.Uint64(t[:])), 0)
 		if !expires.Before(time.Now()) {
-			mu.Unlock()
+			mu.Unlock(c.lm)
 			return nil
 		}
 
 		// Delete the expired cache file
 		_ = os.Remove(path)
-		mu.Unlock()
+		mu.Unlock(c.lm)
 		return nil
 	})
 }
@@ -357,35 +358,35 @@ func (c *fileCache) waitForUpdateIntent(key string, timeout time.Duration) bool 
 // GetStream returns a cached response with a streamable body
 // File format: [8 bytes expiry][4 bytes metadata length][metadata JSON][body data]
 func (c *fileCache) GetStream(key string) (*cachedResponse, error) {
-	mu := c.pm.MutexAt(key)
-	mu.RLock()
+	mu := c.lm.getLock(key)
+	mu.RLock(c.lm)
 
 	p := keyPath(c.path, key)
 
 	// Check if file exists
 	if info, err := os.Stat(p); err != nil || info.IsDir() {
-		mu.RUnlock()
+		mu.RUnlock(c.lm)
 		return nil, errCacheMiss
 	}
 
 	// Open file for reading
 	file, err := os.Open(filepath.Clean(p))
 	if err != nil {
-		mu.RUnlock()
+		mu.RUnlock(c.lm)
 		return nil, fmt.Errorf("error opening cache file %q: %w", p, err)
 	}
 
 	// Read expiry timestamp (8 bytes)
 	var expiryBuf [8]byte
 	if _, err := io.ReadFull(file, expiryBuf[:]); err != nil {
-		mu.RUnlock()
+		mu.RUnlock(c.lm)
 		_ = file.Close()
 		return nil, errCacheMiss
 	}
 
 	expires := time.Unix(int64(binary.LittleEndian.Uint64(expiryBuf[:])), 0)
 	if expires.Before(time.Now()) {
-		mu.RUnlock()
+		mu.RUnlock(c.lm)
 		_ = file.Close()
 		_ = os.Remove(p)
 		return nil, errCacheMiss
@@ -394,7 +395,7 @@ func (c *fileCache) GetStream(key string) (*cachedResponse, error) {
 	// Read metadata length (4 bytes)
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(file, lenBuf[:]); err != nil {
-		mu.RUnlock()
+		mu.RUnlock(c.lm)
 		_ = file.Close()
 		return nil, fmt.Errorf("error reading metadata length: %w", err)
 	}
@@ -403,7 +404,7 @@ func (c *fileCache) GetStream(key string) (*cachedResponse, error) {
 	// Protect against metadata bomb DoS attack
 	const maxMetadataSize = 1 << 20 // 1MB should be more than enough for headers
 	if metadataLen > maxMetadataSize {
-		mu.RUnlock()
+		mu.RUnlock(c.lm)
 		_ = file.Close()
 		_ = os.Remove(p) // Remove malicious/corrupt file
 		return nil, fmt.Errorf("metadata too large: %d bytes (max: %d)", metadataLen, maxMetadataSize)
@@ -412,7 +413,7 @@ func (c *fileCache) GetStream(key string) (*cachedResponse, error) {
 	// Read metadata binary
 	metadataBuf := make([]byte, metadataLen)
 	if _, err := io.ReadFull(file, metadataBuf); err != nil {
-		mu.RUnlock()
+		mu.RUnlock(c.lm)
 		_ = file.Close()
 		return nil, fmt.Errorf("error reading metadata: %w", err)
 	}
@@ -420,7 +421,7 @@ func (c *fileCache) GetStream(key string) (*cachedResponse, error) {
 	// Unmarshal metadata
 	metadata, err := unmarshalMetadata(metadataBuf)
 	if err != nil {
-		mu.RUnlock()
+		mu.RUnlock(c.lm)
 		_ = file.Close()
 		return nil, fmt.Errorf("error unmarshaling metadata: %w", err)
 	}
@@ -428,9 +429,8 @@ func (c *fileCache) GetStream(key string) (*cachedResponse, error) {
 	// File is now positioned at start of body data - wrap for streaming
 	body := &bodyReader{
 		file: file,
-		unlock: func() {
-			mu.RUnlock()
-		},
+		lm:   c.lm,
+		path: key,
 	}
 
 	return &cachedResponse{
@@ -441,8 +441,9 @@ func (c *fileCache) GetStream(key string) (*cachedResponse, error) {
 
 // bodyReader wraps a file and adds cleanup on close
 type bodyReader struct {
-	file   *os.File
-	unlock func()
+	file *os.File
+	lm   *lockManager
+	path string
 }
 
 func (br *bodyReader) Read(p []byte) (n int, err error) {
@@ -451,9 +452,10 @@ func (br *bodyReader) Read(p []byte) (n int, err error) {
 
 func (br *bodyReader) Close() error {
 	err := br.file.Close()
-	if br.unlock != nil {
-		br.unlock()
-		br.unlock = nil // Prevent double unlock
+	if br.lm != nil {
+		handle := lockHandle{path: br.path}
+		handle.RUnlock(br.lm)
+		br.lm = nil // Prevent double unlock
 	}
 	return err
 }
@@ -462,7 +464,7 @@ func (br *bodyReader) Close() error {
 type streamingCacheWriter struct {
 	file         *bufio.Writer
 	rawFile      *os.File
-	pm           *pathMutex
+	lm           *lockManager
 	key          string
 	filepath     string // Final destination path
 	tempFilepath string // Temporary write path
@@ -496,8 +498,8 @@ func (scw *streamingCacheWriter) Abort() error {
 	scw.file.Reset(nil)
 	bufferPool.Put(scw.file)
 
-	mu := scw.pm.MutexAt(scw.key)
-	mu.Unlock()
+	mu := scw.lm.getLock(scw.key)
+	mu.Unlock(scw.lm)
 	return nil
 }
 
@@ -516,8 +518,8 @@ func (scw *streamingCacheWriter) Commit() error {
 		_ = os.Remove(scw.tempFilepath) // Clean up temp file on error
 		scw.file.Reset(nil)
 		bufferPool.Put(scw.file)
-		mu := scw.pm.MutexAt(scw.key)
-		mu.Unlock()
+		mu := scw.lm.getLock(scw.key)
+		mu.Unlock(scw.lm)
 		return fmt.Errorf("error flushing cache file: %w", err)
 	}
 
@@ -526,8 +528,8 @@ func (scw *streamingCacheWriter) Commit() error {
 		_ = os.Remove(scw.tempFilepath) // Clean up temp file on error
 		scw.file.Reset(nil)
 		bufferPool.Put(scw.file)
-		mu := scw.pm.MutexAt(scw.key)
-		mu.Unlock()
+		mu := scw.lm.getLock(scw.key)
+		mu.Unlock(scw.lm)
 		return fmt.Errorf("error closing cache file: %w", err)
 	}
 
@@ -539,13 +541,13 @@ func (scw *streamingCacheWriter) Commit() error {
 	// This ensures partial writes are never visible as valid cache entries
 	if err := atomicRename(scw.tempFilepath, scw.filepath); err != nil {
 		_ = os.Remove(scw.tempFilepath) // Clean up on failure
-		mu := scw.pm.MutexAt(scw.key)
-		mu.Unlock()
+		mu := scw.lm.getLock(scw.key)
+		mu.Unlock(scw.lm)
 		return fmt.Errorf("error committing cache file: %w", err)
 	}
 
-	mu := scw.pm.MutexAt(scw.key)
-	mu.Unlock()
+	mu := scw.lm.getLock(scw.key)
+	mu.Unlock(scw.lm)
 
 	return nil
 }
@@ -554,10 +556,10 @@ func (scw *streamingCacheWriter) Commit() error {
 // Returns errCacheWriteInProgress if another writer currently holds the lock
 // Caller holds exclusive write lock until Commit() or Abort()
 func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Duration) (*streamingCacheWriter, error) {
-	mu := c.pm.MutexAt(key)
+	mu := c.lm.getLock(key)
 
 	// Non-blocking lock acquisition for double-checked locking
-	if !mu.TryLock() {
+	if !mu.TryLock(c.lm) {
 		return nil, errCacheWriteInProgress
 	}
 
@@ -565,14 +567,14 @@ func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Du
 
 	// Create directory structure
 	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
-		mu.Unlock()
+		mu.Unlock(c.lm)
 		return nil, fmt.Errorf("error creating file path: %w", err)
 	}
 
 	// Marshal metadata to binary with configured limits
 	metadataBinary, err := marshalMetadata(metadata, c.maxHeaderPairs, c.maxHeaderKeyLen, c.maxHeaderValueLen)
 	if err != nil {
-		mu.Unlock()
+		mu.Unlock(c.lm)
 		return nil, fmt.Errorf("error marshaling metadata: %w", err)
 	}
 
@@ -582,7 +584,7 @@ func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Du
 	tempPath := p + ".tmp." + randomSuffix()
 	file, err := os.OpenFile(filepath.Clean(tempPath), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
-		mu.Unlock()
+		mu.Unlock(c.lm)
 		return nil, fmt.Errorf("error creating temp cache file: %w", err)
 	}
 
@@ -599,7 +601,7 @@ func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Du
 		_ = os.Remove(tempPath) // Clean up temp file
 		bufWriter.Reset(nil)
 		bufferPool.Put(bufWriter)
-		mu.Unlock()
+		mu.Unlock(c.lm)
 		return nil, fmt.Errorf("error writing expiry: %w", err)
 	}
 
@@ -611,7 +613,7 @@ func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Du
 		_ = os.Remove(tempPath) // Clean up temp file
 		bufWriter.Reset(nil)
 		bufferPool.Put(bufWriter)
-		mu.Unlock()
+		mu.Unlock(c.lm)
 		return nil, fmt.Errorf("error writing metadata length: %w", err)
 	}
 
@@ -621,7 +623,7 @@ func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Du
 		_ = os.Remove(tempPath) // Clean up temp file
 		bufWriter.Reset(nil)
 		bufferPool.Put(bufWriter)
-		mu.Unlock()
+		mu.Unlock(c.lm)
 		return nil, fmt.Errorf("error writing metadata: %w", err)
 	}
 
@@ -629,7 +631,7 @@ func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Du
 	return &streamingCacheWriter{
 		file:         bufWriter,
 		rawFile:      file,
-		pm:           c.pm,
+		lm:           c.lm,
 		key:          key,
 		filepath:     p,
 		tempFilepath: tempPath,
@@ -697,60 +699,123 @@ func keyPath(path, key string) string {
 	return string(result)
 }
 
-type pathMutex struct {
-	mu   sync.Mutex
-	lock map[string]*fileLock
+// lockManager manages per-path locks using string keys instead of pointers
+// This avoids yaegi issues with custom pointer types in maps and closures
+type lockManager struct {
+	mu    sync.Mutex
+	locks map[string]*lockEntry
 }
 
-func (m *pathMutex) MutexAt(path string) *fileLock {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// lockEntry contains the actual RWMutex and reference count
+// Note: We still use *lockEntry in the map, but we never pass this
+// pointer type through reflection or store it in other structs
+type lockEntry struct {
+	mu  sync.RWMutex
+	ref int
+}
 
-	if fl, ok := m.lock[path]; ok {
-		fl.ref++
-		return fl
+// lockHandle is what we return to callers - just data, no pointers
+// This is the key to yaegi compatibility
+type lockHandle struct {
+	path string
+}
+
+func newLockManager() *lockManager {
+	return &lockManager{
+		locks: make(map[string]*lockEntry),
+	}
+}
+
+// getLock returns a lock handle for the given path
+// This is the replacement for pathMutex.MutexAt()
+func (lm *lockManager) getLock(path string) lockHandle {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	entry, exists := lm.locks[path]
+	if !exists {
+		entry = &lockEntry{ref: 0}
+		lm.locks[path] = entry
+	}
+	entry.ref++
+
+	return lockHandle{path: path}
+}
+
+// releaseLock decrements reference count and cleans up if needed
+// This replaces the closure-based cleanup
+func (lm *lockManager) releaseLock(path string) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	entry, exists := lm.locks[path]
+	if !exists {
+		return // Already cleaned up
 	}
 
-	fl := &fileLock{ref: 1}
-	fl.cleanup = func() {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-
-		fl.ref--
-		if fl.ref == 0 {
-			delete(m.lock, path)
-		}
+	entry.ref--
+	if entry.ref == 0 {
+		delete(lm.locks, path)
 	}
-	m.lock[path] = fl
-
-	return fl
 }
 
-type fileLock struct {
-	ref     int
-	cleanup func()
-
-	mu sync.RWMutex
+// lockEntry returns the actual mutex for operations
+// This is an internal helper - never exposes *lockEntry to callers
+func (lm *lockManager) lockEntry(path string) *lockEntry {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	return lm.locks[path] // May be nil if already cleaned up
 }
 
-func (l *fileLock) RLock() {
-	l.mu.RLock()
+// RLock acquires a read lock
+func (h lockHandle) RLock(lm *lockManager) {
+	entry := lm.lockEntry(h.path)
+	if entry != nil {
+		entry.mu.RLock()
+	}
 }
 
-func (l *fileLock) RUnlock() {
-	l.mu.RUnlock()
-	l.cleanup()
+// RUnlock releases a read lock and cleans up
+func (h lockHandle) RUnlock(lm *lockManager) {
+	entry := lm.lockEntry(h.path)
+	if entry != nil {
+		entry.mu.RUnlock()
+	}
+	lm.releaseLock(h.path)
 }
 
-func (l *fileLock) Lock() {
-	l.mu.Lock()
+// Lock acquires a write lock
+func (h lockHandle) Lock(lm *lockManager) {
+	entry := lm.lockEntry(h.path)
+	if entry != nil {
+		entry.mu.Lock()
+	}
 }
 
-func (l *fileLock) TryLock() bool {
-	return l.mu.TryLock()
+// TryLock attempts to acquire a write lock without blocking
+func (h lockHandle) TryLock(lm *lockManager) bool {
+	entry := lm.lockEntry(h.path)
+	if entry == nil {
+		return false
+	}
+	return entry.mu.TryLock()
 }
 
-func (l *fileLock) Unlock() {
-	l.mu.Unlock()
-	l.cleanup()
+// Unlock releases a write lock and cleans up
+func (h lockHandle) Unlock(lm *lockManager) {
+	entry := lm.lockEntry(h.path)
+	if entry != nil {
+		entry.mu.Unlock()
+	}
+	lm.releaseLock(h.path)
+}
+
+// atomicRename performs an atomic rename operation
+// On Windows, returns an error as this is not supported in Yaegi
+// On Unix systems, os.Rename is atomic when source and destination are on the same filesystem
+func atomicRename(oldpath, newpath string) error {
+	if runtime.GOOS == "windows" {
+		return errors.New("cacheify plugin is not supported on Windows - Unix/Linux/macOS only")
+	}
+	return os.Rename(oldpath, newpath)
 }

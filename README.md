@@ -1,6 +1,6 @@
 # Cacheify
 
-Simple cache plugin middleware caches responses on disk. 
+Simple cache plugin middleware caches responses on disk.
 
 Based on the original plugin-simplecache, but with some significant performance improvements
 - Cache hits are now up to 13× faster and use 45% less memory, with large payloads seeing over 90% latency reduction.
@@ -9,6 +9,10 @@ Based on the original plugin-simplecache, but with some significant performance 
 - Improved concurrent hit performance (no longer contended)
 - Simplified and accelerated cache key generation (-75–88% time)
 - Achieved ~36% faster benchmarks overall and ~60% higher throughput
+
+## Platform Support
+
+**Unix/Linux/macOS only** - This plugin is not compatible with Windows due to Traefik's Yaegi interpreter security restrictions on `unsafe` and `syscall` packages required for atomic file operations on Windows.
 
 ## Configuration
 

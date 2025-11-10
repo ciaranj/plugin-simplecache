@@ -188,18 +188,17 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		checkCacheable: m.cacheable,
 	}
 
-	// Ensure finalize is called even if ServeHTTP panics
-	// This prevents lock leaks and partial cache files
+	// Ensure finalize is called to commit or abort cache write
+	// If upstream panics, mark writeErr so finalize() aborts instead of commits
 	defer func() {
 		if r := recover(); r != nil {
-			// A panic occurred - abort the cache write
-			if err := rw.abort(); err != nil {
-				log.Printf("Error aborting cache: %v", err)
-			}
-			panic(r) // Re-panic after cleanup
+			// Upstream handler panicked - ensure we abort the cache write
+			rw.writeErr = errors.New("upstream handler panicked")
+			// Let the request fail gracefully (don't re-panic)
+			log.Printf("Upstream handler panic (aborting cache write): %v", r)
 		}
 
-		// Normal completion - finalize (commit or abort based on errors)
+		// Always finalize (commit if no errors, abort if writeErr is set)
 		if err := rw.finalize(); err != nil {
 			log.Printf("Error finalizing cache: %v", err)
 		}
@@ -352,13 +351,6 @@ func (rw *responseWriter) Write(p []byte) (int, error) {
 		rw.writeErr = err
 	}
 	return n, err
-}
-
-func (rw *responseWriter) abort() error {
-	if rw.cacheWriter != nil {
-		rw.cacheWriter.Abort()
-	}
-	return nil
 }
 
 func (rw *responseWriter) finalize() error {
