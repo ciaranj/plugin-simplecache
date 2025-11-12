@@ -552,16 +552,15 @@ func (scw *streamingCacheWriter) Commit() error {
 	return nil
 }
 
-// SetStream starts a streaming cache write (non-blocking)
-// Returns errCacheWriteInProgress if another writer currently holds the lock
+// SetStream starts a streaming cache write
 // Caller holds exclusive write lock until Commit() or Abort()
+// The updateIntent mechanism ensures only one writer per key, so we use blocking Lock()
 func (c *fileCache) SetStream(key string, metadata cacheMetadata, expiry time.Duration) (*streamingCacheWriter, error) {
 	mu := c.lm.getLock(key)
 
-	// Non-blocking lock acquisition for double-checked locking
-	if !mu.TryLock(c.lm) {
-		return nil, errCacheWriteInProgress
-	}
+	// Acquire write lock (blocking)
+	// This is safe because updateIntent ensures only one writer per key attempts this
+	mu.Lock(c.lm)
 
 	p := keyPath(c.path, key)
 
@@ -790,15 +789,6 @@ func (h lockHandle) Lock(lm *lockManager) {
 	if entry != nil {
 		entry.mu.Lock()
 	}
-}
-
-// TryLock attempts to acquire a write lock without blocking
-func (h lockHandle) TryLock(lm *lockManager) bool {
-	entry := lm.lockEntry(h.path)
-	if entry == nil {
-		return false
-	}
-	return entry.mu.TryLock()
 }
 
 // Unlock releases a write lock and cleans up
